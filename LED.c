@@ -1,7 +1,7 @@
 #include <stdio.h>
 #include <stdlib.h>
 #include "../../BBBio_lib/BBBiolib.h"
-
+#define threshold 10
 
 void WheeledA_init()
 {
@@ -99,12 +99,16 @@ int main(void)
 	while(1)
 	{
 		//BBBIO_PWMSS_Setting(BBBIO_PWMSS0, PWM_HZ ,duty_A , duty_B);
-
 		//BBBIO_ehrPWM_Enable(1);
 		//BBBIO_ehrPWM_Enable(BBBIO_PWMSS0);
 		//BBBIO_ehrPWM_Enable(0);
 		countA = 0;
 		countB = 0;
+
+		BBBIO_ehrPWM_Enable(1);
+		BBBIO_ehrPWM_Enable(0);
+
+
 		do{
 		if (is_high(8,11))
 		{
@@ -154,8 +158,10 @@ int main(void)
 			countB++;
 		}		
 		//iolib_delay_ms(10);
-		}while(countA >= 50 || countB >= 50)
+		}while(countA < threshold && countB < threshold);
 
+		printf("%d\n%d\n",countA,countB);
+		
 		BBBIO_ehrPWM_Disable(BBBIO_PWMSS1);
 		BBBIO_ehrPWM_Disable(BBBIO_PWMSS0);
 		//A輪比B輪快
@@ -178,11 +184,12 @@ int main(void)
 				{
 					countB++;
 				}
-			}while(countB == 50)
+			}while(countB < threshold);
 		}
 		//B輪比A輪快
-		if(countB > countA)
-		{
+		else
+			if(countB > countA)
+			{
 			BBBIO_ehrPWM_Enable(BBBIO_PWMSS1);
 			do{
 				if (is_high(8,11))
@@ -200,7 +207,7 @@ int main(void)
 			{
 				countA++;
 			}
-			}while(countA == 50)
+			}while(countA < threshold);
 		}	
 	}
 
