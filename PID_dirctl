@@ -1,0 +1,581 @@
+#include <stdio.h>
+#include <stdlib.h>
+#include "../../BBBio_lib/BBBiolib.h"
+#include <string.h>
+#include <time.h>
+#include <unistd.h>
+#include <sys/time.h>
+#include <termios.h> 
+#include <fcntl.h> 
+#include <linux/i2c-dev.h>
+#include <sys/ioctl.h>
+#include <math.h>
+
+#define checkpoint 10
+#define distance 150
+#define turn_degree 30//It will approach to 90 degree
+#define PWM 25.0f
+//======== L3G4200D =========
+#define L3G_ADDR	0x69	//i2c
+#define L3G_CTL_REG1	0x20
+#define L3G_CTL_REG2	0x21
+#define L3G_CTL_REG4	0x23	//DPS
+#define L3G_STATUS_REG	0x27
+#define L3G_X_L		0x28
+#define L3G_X_H		0x29
+#define L3G_Y_L		0x2A
+#define L3G_Y_H		0x2B
+#define L3G_Z_L		0x2C
+#define L3G_Z_H		0x2D
+#define FIX_TIME	100
+
+//陀螺儀的degree per seconed範圍
+/*
+ * +- 200, 8.75mdps/digit	
+ * +- 500, 17.5
+ * +- 2000, 70
+ */
+#define GYRO_POS_LIMIT	500
+#define GYRO_NEG_LIMIT	-500
+#define dpsPerDigit	.0175f
+
+#define GYRO_DIV	100	//加速度區間
+
+//---------------global value---------------
+short div_gyro_buf[3] = {0,0,0};		// (QS用)	gryo角速度 / GYRO_DIV = state區間
+short goal_gyro[3] = {0,0,0};	// 目標加速度/GYRO_DIV 
+short l3g_regulate_buf[3] = {0, 0, 0}; //靜態基準
+float l3g_angle[3] = {0, 0, 0};	//目前傾斜角度	//comp	YZ面，XZ面，水平旋轉		
+float l3g_angle2[3] = {0, 0, 0};	//目前傾斜角度2	//純陀螺儀累積，會有誤差，畫圖用
+short acc_buf[3] = {0,0,0};	//目前的三軸數值	x,y,z
+short gyro_buf[3] = {0,0,0};	//目前的加速度值	繞X軸,繞Y軸,z
+
+float compAngle[3] = {0,0,0};	//互補濾波角度	{Axr,Ayr,Azr}
+
+const float kp = 0.4;
+const float ki = 0.0;
+const float kd = 0.2;
+struct timespec start;
+struct timespec end;
+struct timespec diff;
+
+struct timeval last_tv;
+//------------------------------------------
+
+float getTimeDif ()
+{
+	static unsigned long diff;
+	struct timeval tv;
+	float d;
+
+	gettimeofday(&tv, NULL);
+
+
+	diff = (1000000L * (tv.tv_sec - last_tv.tv_sec) + tv.tv_usec - last_tv.tv_usec) / 1000L;	
+	d = diff/1000.0;
+
+
+	//printf("diff time: %.4f\n", d);
+	last_tv = tv;
+
+	return d;
+}
+
+void l3g_init (int file)
+{
+	char wbuf[2] =  {L3G_CTL_REG1,0x0f};	//100hz
+	char wbuf2[2] =  {L3G_CTL_REG4,0x90};
+
+	if (ioctl(file, I2C_SLAVE, L3G_ADDR) <0) {
+		printf("i2c open error\n");
+		return ;
+	}
+	//ODR:200hz, cut-off:12.5
+	write(file, wbuf, 2);
+	//block data update
+	write(file, wbuf2, 2);
+}
+void l3g_ctl (int file, float timeDiff)
+{
+	char read_start_buf[6] = {L3G_X_H, L3G_Y_H, L3G_Z_H, L3G_X_L, L3G_Y_L, L3G_Z_L};
+	char hi_buf, lo_buf;
+	char i;
+	short	x,y,z;
+	short	status;
+	short	gyroDPS[3] = {0,0,0};		//瞬時角速度
+	short	deltaGyro[3] = {0,0,0};		//扣除前一次，本次檢測時間內的角速度差
+	float	gyroDPSDelta[3] = {0,0,0};	//時間內移動的角度
+	short	l3g_last_dps[3] = {0,0,0};	//前一次的角速度值
+
+	if (ioctl(file, I2C_SLAVE, L3G_ADDR) <0) 
+	{
+		printf("i2c open error\n");
+		return ;
+	}
+
+	// 0:圍繞X軸(YZ平面傾角)，1:圍繞Y軸(XZ平面傾角)，2:圍繞Z軸(水平旋轉角度)
+
+	for (i=0;i<3;i++) 
+	{
+		write(file, &read_start_buf[i], 1);
+		read(file,&hi_buf,1);
+		write(file, &read_start_buf[i+3], 1);
+		read(file,&lo_buf,1);
+		status = (hi_buf << 8) | lo_buf;
+		deltaGyro[i] = status - l3g_last_dps[i];	//與前次相減
+		gyroDPS[i] = (short)(deltaGyro[i] * dpsPerDigit);	//帶上精度
+		if (gyroDPS[i] > GYRO_POS_LIMIT ) gyroDPS[i] = GYRO_POS_LIMIT;		//極值過濾
+		else if (gyroDPS[i] < GYRO_NEG_LIMIT) gyroDPS[i] = GYRO_NEG_LIMIT;
+
+		//if (abs(gyroDPS[i]) <= l3g_regulate_buf[i]) gyroDPS[i] = 0; //低於平均誤差，視為沒變
+
+		//偷懶拉
+		//if (i == 2 ) gyroDPS[i] = 0;
+
+
+		gyroDPSDelta[i] = (float)(gyroDPS[i] * timeDiff);
+		l3g_angle[i] +=gyroDPSDelta[i];	//累積移動角度，互補濾波
+		l3g_angle2[i] +=gyroDPSDelta[i];	//累積移動角度
+
+		l3g_last_dps[i] = status;	//記錄本次，供下次算差距
+
+		gyro_buf[i] = gyroDPS[i];
+
+
+		//區間處理
+		if (gyroDPS[i] == 0) div_gyro_buf[i] = 0;
+		else if ((gyroDPS[i] > 0) && (gyroDPS[i] < GYRO_DIV)) div_gyro_buf[i] = (gyroDPS[i]/GYRO_DIV) +1;
+		else if ((gyroDPS[i] < 0) && ( abs(gyroDPS[i]) < GYRO_DIV)) div_gyro_buf[i] = (gyroDPS[i]/GYRO_DIV) -1;
+		else  div_gyro_buf[i] = gyroDPS[i]/GYRO_DIV;
+	}
+
+	//	printf("角速度 [0]:%d, [1]:%d,[2]:%d\n",gyro_buf[0],gyro_buf[1],gyro_buf[2]);
+
+	printf("\n=====\n瞬時Y角速度: %d, angle:%4lf \n",gyro_buf[2], l3g_angle2[2]);//div_gyro_buf[1]);	//gyro只看Y  so far 03/30
+
+}
+
+typedef struct PID
+{
+	float target;     //目標
+	float Proportion; //kp
+	float Integral;   //ki
+	float Derivative; //kd
+	float pre2Err;    //pre two step err
+	float preErr;     //pre err
+}PID;
+float PIDCale(PID *p,float input)
+{
+	float Err,pErr,dErr,sum,acc_err;
+
+	Err = p->target - input;  //當前誤差
+	/*kp * delta e(k) + ki * e(k) + kd[delta e(k) - delta e(k-1)]; "delta e(k) = e(k) - e(k-1)" "Incremental_PID method"*/
+	pErr = Err - p->preErr;   //比例項增量式誤差
+	//sum = p->Proportion * pErr + p->Integral * Err;// + p->Derivative * (pErr * (p->preErr - p->pre2Err));
+
+	/*位置式PID控制*/
+	acc_err = (acc_err + Err) / checkpoint;//accumulated error
+	//sum = p->Proportion * Err + p->Integral * acc_err;//PI controll
+	sum = p->Proportion * Err + p->Derivative * (Err + p->preErr) / checkpoint + p->Integral * acc_err;//PD controll
+
+	//dErr = Err - 2 * p->preErr + p->pre2Err;  //微分項增量式誤差
+	//sum = p->Proportion * pErr + p->Derivative * dErr;// + p->Integral * Err;  //控制量增量
+	p->pre2Err = p->preErr;
+	p->preErr = Err;
+	return sum;
+}
+void PIDInit(PID p)
+{
+	//printf("pidinit");
+	memset(&p,0,sizeof(PID));  //初始化
+}
+
+int kbhit(void)  
+{  
+	struct termios oldt, newt;  
+	int ch;  
+	int oldf;
+
+	tcgetattr(STDIN_FILENO, &oldt);  
+	newt = oldt;  
+	newt.c_lflag &= ~(ICANON | ECHO);  
+	tcsetattr(STDIN_FILENO, TCSANOW, &newt);  
+	oldf = fcntl(STDIN_FILENO, F_GETFL, 0);  
+	fcntl(STDIN_FILENO, F_SETFL, oldf | O_NONBLOCK);  
+	ch = getchar();  
+	tcsetattr(STDIN_FILENO, TCSANOW, &oldt);  
+	fcntl(STDIN_FILENO, F_SETFL, oldf);  
+	if(ch != EOF)  
+	{  
+		ungetc(ch, stdin);  
+		return ch;
+	}  
+	return 0;  
+}  
+
+void WheeledA_init()
+{
+	char now_valueA = 0, tmpA = 0;
+
+	BBBIO_ehrPWM_Enable(1);
+	while(1)
+	{
+		if(is_high(8,11))
+		{
+			tmpA = now_valueA;
+			now_valueA = 1;
+		}
+		else
+			if(is_low(8,11))
+			{
+				tmpA = now_valueA;
+				now_valueA = 0;
+			}
+		if(now_valueA == 1 && tmpA + now_valueA == 1)
+		{
+			BBBIO_ehrPWM_Disable(BBBIO_PWMSS1);	
+			break;	
+		}
+	}
+}
+
+void WheeledB_init()
+{
+	char now_valueB = 0, tmpB = 0;
+
+	BBBIO_ehrPWM_Enable(0);
+	while(1)
+	{
+		if (is_high(8,12))
+		{
+			tmpB = now_valueB;
+			now_valueB = 1;
+		}	
+		else
+			if (is_low(8,12))
+			{
+				tmpB = now_valueB;
+				now_valueB = 0;
+			}
+		if(now_valueB == 1 && tmpB + now_valueB == 1)
+		{
+			BBBIO_ehrPWM_Disable(BBBIO_PWMSS0);
+			break;
+		}
+	}
+}
+
+int main(void)
+{
+	//printf("main\n");
+	//int del;
+	iolib_init();
+	iolib_setdir(8,11, BBBIO_DIR_IN);
+	iolib_setdir(8,12, BBBIO_DIR_IN);
+
+	const float PWM_HZ = 100.0f;    /* 100 Hz */
+	float duty_A = PWM;
+	float duty_B = PWM * 0.6;
+	float out_A[distance];
+	float out_B[distance];
+	float PWM_B[distance];
+	float out_l3g[distance];
+
+	float countA = 0,countB = 0;
+	char now_valueA = 0, tmpA = 1;
+	char now_valueB = 0, tmpB = 1;
+	float Pout = 0,pide = 0,pidg = 0;
+	float time,used_time;
+	int i = 0,count = 0;
+	char command;
+	struct PID p;
+	int file;
+	float timeDiff;
+
+	if ((file = open("/dev/i2c-1",O_RDWR)) <0 ) 
+	{
+		printf("file open error\n");
+		return ;
+	}
+
+	BBBIO_PWMSS_Setting(1, PWM_HZ ,0.1f , duty_A);
+	BBBIO_PWMSS_Setting(0, PWM_HZ ,duty_B , 0.1f);
+	
+	PIDInit(p);
+	p.Proportion = kp;
+	p.Integral = ki;
+	p.Derivative = kd;
+	//printf("log1.5\n");
+	WheeledB_init();
+	WheeledA_init();
+	l3g_init(file);
+	//printf("log2\n");
+	//printf("log3\n");
+	while(1)
+	{
+		//printf("log4\n");	
+		while(!kbhit())
+		{
+			//l3g_angle2[2] = 0;
+			timeDiff = getTimeDif();
+			l3g_ctl(file, timeDiff);
+			
+		}
+		command = kbhit();
+		command = getchar();
+
+		switch(command)
+		{
+			case 'w':
+				//printf("%c\n",command);
+
+				BBBIO_PWMSS_Setting(1, PWM_HZ ,0.1f , duty_A);
+				BBBIO_PWMSS_Setting(0, PWM_HZ ,duty_B , 0.1f);
+				BBBIO_ehrPWM_Enable(1);
+				BBBIO_ehrPWM_Enable(0);
+
+				while(count < distance)
+				{
+					countA = 0;
+					countB = 0;
+					//clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start);
+
+					do{
+						if (is_high(8,11))
+						{
+							tmpA = now_valueA;
+							now_valueA = 1;
+						}
+						else
+						{
+							tmpA = now_valueA;
+							now_valueA = 0;
+						}
+						if (is_high(8,12))
+						{
+							tmpB = now_valueB;
+							now_valueB = 1;
+
+						}
+						else
+						{           
+							tmpB = now_valueB;
+							now_valueB = 0;
+						}
+
+						if(tmpA == 0 && now_valueA == 1)
+						{
+							countA++;
+						}
+
+						if(tmpB == 0 && now_valueB == 1)
+						{
+							countB++;
+						}		
+						//iolib_delay_ms(10);
+					}while(countA < checkpoint);// && countB < checkpoint);
+					/*
+					   clock_gettime(CLOCK_THREAD_CPUTIME_ID, &end);
+					   diff.tv_sec = ( end.tv_sec - start.tv_sec );
+					   diff.tv_nsec = ( end.tv_nsec - start.tv_nsec );
+					   if (diff.tv_nsec < 0) 
+					   {
+					   diff.tv_sec--;
+					   diff.tv_nsec += 1000000000;
+					   }
+					   int usec = diff.tv_nsec + diff.tv_sec * 100000000;
+					   double resultTime = (double)usec / 1000000;
+					   printf("TimeMeasure: used time %6.1lf[ms]\n", resultTime);
+					*/
+					//printf("%f\n%f\n",countA,countB);	
+					/*	
+					p.target = (float)countA;
+					Pout = PIDCale(&p,countB);
+					duty_B += Pout;
+					
+					timeDiff = getTimeDif();
+					l3g_ctl(file, timeDiff);
+					*/
+						
+					p.target = (float)countA;
+					pide = PIDCale(&p,countB);
+
+					timeDiff = getTimeDif();
+					l3g_ctl(file, timeDiff);
+					p.target = 0.0;
+						
+					//if(gyro_buf[2] < 20 && gyro_buf[2] > -20)
+					//	pidg = 0;
+					//else
+						pidg = 0.05 * (PIDCale(&p,gyro_buf[2]));
+					Pout = pide + pidg;
+					duty_B += Pout;
+					printf("%f\n",pidg);	
+					/*very importemt*/
+					if(duty_B <= 0)
+						duty_B = 0.1;
+					if(duty_B > 100)
+						duty_B = 100.0;
+
+					BBBIO_PWMSS_Setting(0, PWM_HZ ,duty_B , 0.1f);
+					BBBIO_ehrPWM_Enable(0);
+					printf("PWMB set to be %lf%\n",duty_B);
+					//out_A[count] = countA;
+					out_B[count] = countB;
+					PWM_B[count] = duty_B;
+					//out_l3g[count] = l3g_angle2[2];
+					out_l3g[count] = gyro_buf[2];
+					count++;
+				}//end while count
+				count = 0;
+				duty_B = PWM * 0.6;
+				l3g_angle2[2] = 0;
+				BBBIO_ehrPWM_Disable(BBBIO_PWMSS1);
+				BBBIO_ehrPWM_Disable(BBBIO_PWMSS0);
+
+				//if(freopen("/BBBIOlib/Demo/Demo_LED/l3gout.txt","w",stdout) == NULL)
+				if(freopen("/mydata/l3gout.txt","w",stdout) == NULL)
+				printf("重定向出错");
+				for(i = 0;i < distance;i++)
+				{
+				   printf("%f\n",out_l3g[i]);
+				}
+				fclose(stdout);
+
+				break;
+			case 's':
+				BBBIO_PWMSS_Setting(1, PWM_HZ ,duty_A , 0.1f);
+				BBBIO_PWMSS_Setting(0, PWM_HZ , 0.1f , duty_B);
+				BBBIO_ehrPWM_Enable(1);
+				BBBIO_ehrPWM_Enable(0);
+
+				while(count < distance)
+				{
+					countA = 0;
+					countB = 0;
+					//clock_gettime(CLOCK_THREAD_CPUTIME_ID, &start);
+
+					do{
+						if (is_high(8,11))
+						{
+							tmpA = now_valueA;
+							now_valueA = 1;
+						}
+						else
+						{
+							tmpA = now_valueA;
+							now_valueA = 0;
+						}
+						if (is_high(8,12))
+						{
+							tmpB = now_valueB;
+							now_valueB = 1;
+
+						}
+						else
+						{
+							tmpB = now_valueB;
+							now_valueB = 0;
+						}
+
+						if(tmpA == 0 && now_valueA == 1)
+						{
+							countA++;
+						}
+
+						if(tmpB == 0 && now_valueB == 1)
+						{
+							countB++;
+						}
+						//iolib_delay_ms(10);
+					}while(countA < checkpoint);// && countB < checkpoint);
+					/*
+					printf("%f\n%f\n",countA,countB);
+					p.target = (float)countA;
+					Pout = PIDCale(&p,countB);
+					duty_B += Pout;
+					*/
+
+					p.target = (float)countA;
+					pide = PIDCale(&p,countB);
+					timeDiff = getTimeDif();
+					l3g_ctl(file, timeDiff);
+					p.target = 0.0;
+					pidg = 0.3 * (PIDCale(&p,gyro_buf[2]));
+
+					Pout = pide - pidg;
+					duty_B += Pout;
+					/*very importemt*/
+					if(duty_B <= 0)
+						duty_B = 0.1;
+					BBBIO_PWMSS_Setting(0, PWM_HZ ,0.1f , duty_B);
+					BBBIO_ehrPWM_Enable(0);
+					printf("PWMB set to be %lf%\n",duty_B);
+					//out_A[count] = countA;
+					out_B[count] = countB;
+					PWM_B[count] = duty_B;
+					count++;
+				}//end while count
+				count = 0;
+				duty_B = PWM * 0.6;
+				l3g_angle2[2] = 0;
+				BBBIO_ehrPWM_Disable(BBBIO_PWMSS1);
+				BBBIO_ehrPWM_Disable(BBBIO_PWMSS0);
+				break;
+			case 'a':
+				BBBIO_PWMSS_Setting(0, PWM_HZ ,25.0f , 0.1f);
+				BBBIO_ehrPWM_Enable(0);
+				do
+				{
+					timeDiff = getTimeDif();
+					l3g_ctl(file, timeDiff);
+				}while(l3g_angle2[2] < turn_degree);
+				l3g_angle2[2] = 0;
+				BBBIO_ehrPWM_Disable(BBBIO_PWMSS0);
+				break;
+			case 'd':
+				BBBIO_PWMSS_Setting(1, PWM_HZ ,0.1f , 25.0f);
+				BBBIO_ehrPWM_Enable(1);
+				do
+				{
+					timeDiff = getTimeDif();
+					l3g_ctl(file, timeDiff);
+				}while(l3g_angle2[2] > -turn_degree);
+				l3g_angle2[2] = 0;
+				BBBIO_ehrPWM_Disable(BBBIO_PWMSS1);
+				break;
+		}//end switch
+
+	}
+	BBBIO_ehrPWM_Disable(BBBIO_PWMSS1);
+	BBBIO_ehrPWM_Disable(BBBIO_PWMSS0);
+	/*
+	   if(freopen("/BBBIOlib/Demo/Demo_LED/outputA.txt","w",stdout) == NULL)
+	   printf("重定向出错");
+
+	   for(i = 0;i < distance;i++)
+	   {
+	   printf("%f\n",out_A[i]);
+	   }
+	   fclose(stdout);
+	 */
+	/*
+	   if(freopen("/BBBIOlib/Demo/Demo_LED/outputB.txt","w",stdout) == NULL)
+	   printf("重定向出错");
+	   for(i = 0;i < distance;i++)
+	   {
+	   printf("%f\n",out_B[i]);
+	   }
+	   fclose(stdout);
+
+	   if(freopen("/BBBIOlib/Demo/Demo_LED/PWM_B.txt","w",stdout) == NULL)
+	   printf("重定向出错");
+	   for(i = 0;i < distance;i++)
+	   {
+	   printf("%f\n",PWM_B[i]);
+	   }
+	   fclose(stdout);
+	 */
+	iolib_free();
+	return(0);
+}
